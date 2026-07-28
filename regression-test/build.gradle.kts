@@ -4,7 +4,9 @@ plugins {
 }
 
 android {
-  compileSdk = 36
+  compileSdk {
+    version = release(37)
+  }
 
   namespace = "okhttp.android.regression"
 
@@ -41,6 +43,7 @@ dependencies {
   }
   androidTestImplementation("com.squareup.okhttp3:mockwebserver:${okhttpLegacyVersion}")
   androidTestImplementation(libs.bouncycastle.bcprov)
+  androidTestImplementation(libs.bouncycastle.bcutil)
   androidTestImplementation(libs.bouncycastle.bctls)
   androidTestImplementation(libs.androidx.junit)
   androidTestImplementation(libs.androidx.espresso.core)

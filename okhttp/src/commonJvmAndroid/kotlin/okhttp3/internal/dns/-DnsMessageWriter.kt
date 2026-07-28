@@ -15,7 +15,7 @@
  */
 @file:Suppress("ktlint:standard:filename")
 
-package okhttp3.dnsoverhttps.internal
+package okhttp3.internal.dns
 
 import java.net.Inet4Address
 import java.net.Inet6Address

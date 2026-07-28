@@ -58,7 +58,7 @@ kotlin {
   android {
     namespace = "okhttp.okhttp3"
     compileSdk {
-      version = release(36)
+      version = release(37)
     }
     minSdk = 21
 
@@ -119,6 +119,7 @@ kotlin {
       dependsOn(commonJvmAndroid)
       dependencies {
         compileOnly(libs.bouncycastle.bcprov)
+        compileOnly(libs.bouncycastle.bcutil)
         compileOnly(libs.bouncycastle.bctls)
         compileOnly(libs.conscrypt.openjdk)
         implementation(libs.androidx.annotation)
@@ -133,6 +134,7 @@ kotlin {
         // These compileOnly dependencies must also be listed in applyOsgiMultiplatform() below.
         compileOnly(libs.conscrypt.openjdk)
         compileOnly(libs.bouncycastle.bcprov)
+        compileOnly(libs.bouncycastle.bcutil)
         compileOnly(libs.bouncycastle.bctls)
 
         // graal build support
@@ -334,13 +336,17 @@ afterEvaluate {
       // Work around robolectric requirements and limitations
       // https://cs.android.com/android-studio/platform/tools/base/+/mirror-goog-studio-main:build-system/gradle-core/src/main/java/com/android/build/gradle/tasks/factory/AndroidUnitTest.java;l=339
       allJvmArgs = allJvmArgs.filter { !it.startsWith("--add-opens") }
+    } else {
+      // Robolectric's FileDescriptor interceptor reaches into jdk.internal.access, which isn't
+      // exported to the unnamed module. Android 17 (API 37) images hit it on startup.
+      jvmArgs("--add-exports=java.base/jdk.internal.access=ALL-UNNAMED")
     }
   }
 }
 
 // Work around issue 8826, where the Sentry SDK assumes that OkHttp's internal-visibility symbols
 // will be suffixed '$okhttp' in deployable artifacts. This isn't intended to be a published API,
-// but it's easy enough for us to keep it working. https://github.com/square/okhttp/issues/8826
+// but it's easy enough for us to keep it working. https://github.com/lysine-dev/okhttp/issues/8826
 tasks.withType<KotlinCompile> {
   compilerOptions {
     freeCompilerArgs.addAll("-module-name=okhttp", "-Xexpect-actual-classes")

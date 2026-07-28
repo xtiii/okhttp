@@ -28,16 +28,16 @@ import java.util.concurrent.atomic.AtomicInteger
 import mockwebserver3.Dispatcher
 import mockwebserver3.MockResponse
 import mockwebserver3.RecordedRequest
-import okhttp3.dnsoverhttps.internal.CLASS_IN
-import okhttp3.dnsoverhttps.internal.DnsMessage
-import okhttp3.dnsoverhttps.internal.DnsMessageReader
-import okhttp3.dnsoverhttps.internal.DnsMessageWriter
-import okhttp3.dnsoverhttps.internal.Question
-import okhttp3.dnsoverhttps.internal.ResourceRecord
-import okhttp3.dnsoverhttps.internal.TYPE_A
-import okhttp3.dnsoverhttps.internal.TYPE_AAAA
-import okhttp3.dnsoverhttps.internal.TYPE_HTTPS
 import okhttp3.internal.concurrent.TaskRunner
+import okhttp3.internal.dns.CLASS_IN
+import okhttp3.internal.dns.DnsMessage
+import okhttp3.internal.dns.DnsMessageReader
+import okhttp3.internal.dns.DnsMessageWriter
+import okhttp3.internal.dns.Question
+import okhttp3.internal.dns.ResourceRecord
+import okhttp3.internal.dns.TYPE_A
+import okhttp3.internal.dns.TYPE_AAAA
+import okhttp3.internal.dns.TYPE_HTTPS
 import okio.Buffer
 import okio.ByteString.Companion.decodeBase64
 
@@ -195,17 +195,8 @@ class FakeDns(
         }
       }
 
-    //     QR = 1 (Response)
-    // OPCODE = 0 (standard query)
-    //     RD = 1 (Recursion Desired)
-    //     RA = 1 (Recursion Available)
-    //  RCODE = 0 (success)
-    //           QR OPCODE AA TC RD RA   Z RCODE
-    val flags = 0b1___0000__0__0__1__1_000__0000
-
-    return DnsMessage(
+    return DnsMessage.response(
       id = request.id,
-      flags = flags,
       questions = request.questions,
       answers = answers,
     )

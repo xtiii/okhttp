@@ -13,34 +13,30 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+@file:OptIn(OkHttpInternalApi::class)
 @file:Suppress("ktlint:standard:filename")
 
-package okhttp3.dnsoverhttps.internal
+package okhttp3.internal.dns
 
 import java.io.IOException
+import java.net.UnknownHostException
 import java.util.concurrent.atomic.AtomicReference
-import okhttp3.Call
-import okhttp3.Callback
 import okhttp3.Dns
 import okhttp3.Protocol
-import okhttp3.Response
 import okhttp3.internal.OkHttpInternalApi
-import okhttp3.internal.testAndSet
-
-// TODO: in-memory caching that uses timeToLive.
-// TODO: honor Https.priority and Https.targetName. Create new calls!
+import okhttp3.internal.concurrent.TaskRunner
 
 /**
- * Implements [Dns.Call] by making multiple HTTPS calls.
+ * An application-layer [Dns.Call] that performs multiple transport-layer [DnsQuery]s in parallel.
+ * This delegates to a query factory for the transport, like UDP or DNS over HTTPS.
  *
  * Concurrency
  * -----------
  *
  * A few things conspire to make concurrency tricky:
  *
- *  * Each DNS record type is queried in parallel; [onResponse] and [onFailure] may be called
- *    concurrently.
- *  * Calls to [Dns.Callback] must be serialized.
+ *  * Each transport-layer [DnsQuery.Callback]s are executed in parallel.
+ *  * Application layer [Dns.Callback]s must be serialized.
  *  * We don't want to use locks to guard access to [Dns.Callback] functions.
  *
  * Each time we receive data for the callback (in the form of records or an exception), we either
@@ -57,57 +53,115 @@ import okhttp3.internal.testAndSet
  * that call is executing.
  */
 @OkHttpInternalApi
-internal class DnsOverHttpsCall(
+class StateMachineDnsCall(
+  private val taskRunner: TaskRunner,
   override val request: Dns.Request,
-  private val calls: List<Call>,
-  private val canceledException: IOException?,
-) : Dns.Call,
-  Callback {
-  @Volatile
-  private var canceled = false
-  private val state = AtomicReference<State>(State.Idle)
+  private val queryFactory: DnsQuery.Factory,
+  private val includeIPv6: Boolean,
+  private val includeServiceMetadata: Boolean,
+) : Dns.Call {
+  private val state = AtomicReference<State>(State.Idle())
+
+  override fun isCanceled() = state.get().canceled
 
   override fun enqueue(callback: Dns.Callback) {
-    val running =
-      State.Running(
-        callback = callback,
-        runningCalls = calls,
-      )
+    val questions =
+      buildList {
+        if (includeServiceMetadata) {
+          add(Question(request.hostname, TYPE_HTTPS))
+        }
+        if (includeIPv6) {
+          add(Question(request.hostname, TYPE_AAAA))
+        }
+        add(Question(request.hostname, TYPE_A))
+      }
 
-    val previous = state.testAndSet(running) { it is State.Idle }
-    check(previous is State.Idle) {
-      "already enqueued"
-    }
+    while (true) {
+      val previous =
+        state.get() as? State.Idle
+          ?: error("already enqueued")
 
-    for (call in calls) {
-      call.enqueue(this)
+      // If it's canceled before it is enqueued, jump straight to Complete.
+      if (previous.canceled) {
+        val next = State.Complete(canceled = true)
+
+        if (!state.compareAndSet(previous, next)) continue // Lost a race, retry.
+
+        taskRunner.newQueue().execute("${request.hostname} dns") {
+          callback.onFailure(this, IOException("canceled"))
+        }
+
+        return
+      }
+
+      val queries =
+        questions.map { question ->
+          queryFactory.newQuery(question)
+        }
+
+      val next =
+        State.Running(
+          canceled = false,
+          callback = callback,
+          runningQueries = queries,
+        )
+
+      if (!state.compareAndSet(previous, next)) continue // Lost a race, retry.
+
+      for (query in queries) {
+        query.enqueue(
+          callback =
+            object : DnsQuery.Callback {
+              override fun onResponse(dnsResponse: DnsMessage) {
+                updateStateAndCallCallbacks(
+                  completedQuery = query,
+                  dnsResponse = dnsResponse,
+                )
+              }
+
+              override fun onFailure(e: IOException) {
+                updateStateAndCallCallbacks(
+                  completedQuery = query,
+                  newException = e,
+                )
+              }
+            },
+        )
+      }
+
+      return
     }
   }
 
-  /**
-   * If this is the last DNS call, call [Callback.onFailure]. Otherwise, hold that call until the
-   * last DNS call completes.
-   */
-  override fun onFailure(
-    call: Call,
-    e: IOException,
-  ) {
-    updateStateAndCallCallbacks(
-      completedCall = call,
-      newException = e,
-    )
+  override fun cancel() {
+    while (true) {
+      val previous = state.get()
+      val next = previous.cancel()
+      if (!state.compareAndSet(previous, next)) continue // Lost a race, retry.
+
+      if (previous is State.Running) {
+        for (query in previous.runningQueries) {
+          query.cancel()
+        }
+      }
+      return
+    }
   }
 
-  override fun onResponse(
-    call: Call,
-    response: Response,
+  private fun updateStateAndCallCallbacks(
+    completedQuery: DnsQuery,
+    dnsResponse: DnsMessage,
   ) {
     val resourceRecords =
       try {
-        decodeResponse(response)
+        when (dnsResponse.responseCode) {
+          RESPONSE_CODE_SUCCESS -> dnsResponse.answers
+          RESPONSE_CODE_SERVER_FAILURE -> throw UnknownHostException("DNS server failure")
+          else -> throw UnknownHostException()
+        }
       } catch (e: IOException) {
         return updateStateAndCallCallbacks(
-          completedCall = call,
+          completedQuery = completedQuery,
           newException = e,
         )
       }
@@ -142,13 +196,13 @@ internal class DnsOverHttpsCall(
       }
 
     updateStateAndCallCallbacks(
-      completedCall = call,
+      completedQuery = completedQuery,
       newRecords = dnsRecords,
     )
   }
 
   private tailrec fun updateStateAndCallCallbacks(
-    completedCall: Call? = null,
+    completedQuery: DnsQuery? = null,
     newRecords: List<Dns.Record> = listOf(),
     newException: IOException? = null,
     lockHeldByThisThread: Boolean = false,
@@ -158,15 +212,14 @@ internal class DnsOverHttpsCall(
         state.get() as? State.Running
           ?: return // Already complete or canceled; nothing to do.
 
-      val newRunningCalls =
+      val newRunningQueries =
         when {
-          completedCall != null -> previous.runningCalls - completedCall
-          else -> previous.runningCalls
+          completedQuery != null -> previous.runningQueries - completedQuery
+          else -> previous.runningQueries
         }
 
       val allExceptions =
         when {
-          canceledException != null -> listOf(canceledException)
           newException != null -> previous.pendingExceptions + newException
           else -> previous.pendingExceptions
         }
@@ -177,7 +230,7 @@ internal class DnsOverHttpsCall(
           else -> previous.pendingRecords
         }
 
-      val last = newRunningCalls.isEmpty()
+      val last = newRunningQueries.isEmpty()
       val lockHeldByAnotherThread = !lockHeldByThisThread && previous.lockHeld
 
       // There's a few reasons why we might not call any callbacks:
@@ -187,8 +240,9 @@ internal class DnsOverHttpsCall(
       if ((!last && allRecords.isEmpty()) || lockHeldByAnotherThread) {
         val next =
           State.Running(
+            canceled = previous.canceled,
             callback = previous.callback,
-            runningCalls = newRunningCalls,
+            runningQueries = newRunningQueries,
             lockHeld = lockHeldByAnotherThread,
             pendingRecords = allRecords,
             pendingExceptions = allExceptions,
@@ -201,13 +255,14 @@ internal class DnsOverHttpsCall(
       val next =
         when {
           last -> {
-            State.Complete
+            State.Complete(previous.canceled)
           }
 
           else -> {
             State.Running(
+              canceled = previous.canceled,
               callback = previous.callback,
-              runningCalls = newRunningCalls,
+              runningQueries = newRunningQueries,
               lockHeld = true,
               pendingRecords = listOf(),
               pendingExceptions = allExceptions,
@@ -240,38 +295,50 @@ internal class DnsOverHttpsCall(
     }
   }
 
-  override fun cancel() {
-    if (canceled) return // Already canceled.
-
-    canceled = true
-    for (call in calls) {
-      call.cancel()
-    }
-  }
-
-  override fun isCanceled() = canceled
-
   private sealed interface State {
-    object Idle : State
+    val canceled: Boolean
+
+    class Idle(
+      override val canceled: Boolean = false,
+    ) : State {
+      override fun cancel() = Idle(canceled = true)
+    }
 
     class Running(
+      override val canceled: Boolean,
       val callback: Dns.Callback,
       val lockHeld: Boolean = false,
-      val runningCalls: List<Call>,
+      val runningQueries: List<DnsQuery>,
       val pendingRecords: List<Dns.Record> = listOf(),
       val pendingExceptions: List<IOException> = listOf(),
     ) : State {
       init {
         check(pendingRecords.isEmpty() || lockHeld)
       }
+
+      override fun cancel() =
+        Running(
+          canceled = true,
+          callback = callback,
+          lockHeld = lockHeld,
+          runningQueries = runningQueries,
+          pendingRecords = pendingRecords,
+          pendingExceptions = pendingExceptions,
+        )
     }
 
-    object Complete : State
+    class Complete(
+      override val canceled: Boolean,
+    ) : State {
+      override fun cancel() = Idle(canceled = true)
+    }
+
+    fun cancel(): State
   }
 }
 
 internal fun Dns.Callback.onFailure(
-  call: DnsOverHttpsCall,
+  call: Dns.Call,
   exceptions: List<IOException>,
 ) {
   val firstException = exceptions.first()

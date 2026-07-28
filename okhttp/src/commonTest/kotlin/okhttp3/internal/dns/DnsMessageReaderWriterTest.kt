@@ -13,12 +13,18 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package okhttp3.dnsoverhttps.internal
+@file:OptIn(OkHttpInternalApi::class)
+
+package okhttp3.internal.dns
 
 import assertk.assertThat
+import assertk.assertions.hasMessage
 import assertk.assertions.isEqualTo
 import java.net.InetAddress
+import java.net.ProtocolException
 import kotlin.test.Test
+import kotlin.test.assertFailsWith
+import okhttp3.internal.OkHttpInternalApi
 import okio.Buffer
 import okio.ByteString.Companion.decodeHex
 
@@ -117,10 +123,10 @@ class DnsMessageReaderWriterTest {
                   InetAddress.getByName("2607:f8b0:4023:1807:0:0:0:8b"),
                 ),
               echConfigList =
-                (
-                  "003dfe0d0039aa00200020a4a7bb34b77c43336c3a2931dd28c87d008218a99b44f1f" +
-                    "0aa8a82537d487d43000400010001000a676f6f676c652e636f6d0000"
-                ).decodeHex(),
+                """
+                003dfe0d0039aa00200020a4a7bb34b77c43336c3a2931dd28c87d008218a99b44f1f0aa8a82537d487d
+                43000400010001000a676f6f676c652e636f6d0000
+                """.decodeHex(ignoreWhitespace = true),
             ),
             ResourceRecord.Https(
               name = "lysine.dev",
@@ -132,6 +138,48 @@ class DnsMessageReaderWriterTest {
           ),
       ),
     )
+  }
+
+  @Test
+  fun `unbounded name compression`() {
+    val buffer = Buffer()
+    buffer.write(
+      """
+      000081800001000100000000066c7973696e65c00c000100010363646ec00c000100010000000000040a141e28
+      """.decodeHex(ignoreWhitespace = true),
+    )
+
+    val reader = DnsMessageReader(buffer)
+    val e =
+      assertFailsWith<ProtocolException> {
+        reader.read()
+      }
+    assertThat(e).hasMessage("malformed DNS message")
+  }
+
+  @Test
+  fun `rejects mandatory service parameter with unsupported key`() {
+    // An HTTPS record whose mandatory value is the single 2-octet SvcParamKey 0x0101 (257), which
+    // OkHttp does not support. RFC 9460 requires such a record be treated as malformed.
+    val buffer = Buffer()
+    buffer.write(
+      "0000818000000001000000000000410001000000000009000100000000020101".decodeHex(),
+    )
+    assertFailsWith<ProtocolException> {
+      DnsMessageReader(buffer).read()
+    }
+  }
+
+  @Test
+  fun `rejects odd length mandatory service parameter`() {
+    // The mandatory value has an odd length, so it can't be a list of 2-octet SvcParamKeys.
+    val buffer = Buffer()
+    buffer.write(
+      "00008180000000010000000000004100010000000000080001000000000103".decodeHex(),
+    )
+    assertFailsWith<ProtocolException> {
+      DnsMessageReader(buffer).read()
+    }
   }
 
   private fun assertRoundTrip(message: DnsMessage) {
